@@ -448,6 +448,32 @@ faster, with the measurements that decide each one.
 loses time, what still needs Python, its dependencies) and plans what follows: efficiency, fewer
 dependencies, a sealed build.
 
+## Command line (`turbo-gen`)
+
+*Added in this fork.* `scripts/turbo-gen` generates from the command line, without the app, by
+driving the engine's `serve` protocol directly, so scripts and coding agents (Claude Code, for
+instance) can use Turbo MLX as a tool. It needs Python 3 (standard library only) and a standalone
+engine:
+
+```sh
+scripts/build-engine.sh                       # gives build/bin/turbo-engine (unsandboxed)
+ln -s "$PWD/scripts/turbo-gen" ~/bin/turbo-gen  # optional: put it on the PATH
+
+turbo-gen --list                                          # the models, and which are downloaded
+turbo-gen "a lighthouse at dusk" -m z-image-turbo -o out.png
+turbo-gen "make it winter" -m flux2-klein -i photo.png -o edit.png
+turbo-gen "" -m seedvr2 -i small.png --upscale 2 -o big.png
+turbo-gen "waves on a rocky shore" -m ltx-2.5 -W 768 -H 512 --frames 121 -o clip.mp4
+```
+
+Models are downloaded in the app; `turbo-gen` reads them from the folder chosen in Settings →
+Models (else `~/.cache/huggingface/hub`), or `TURBO_HUB`. Each call starts a fresh engine and loads
+the model, prints progress on stderr, and ends with one JSON line on stdout (`path`, `seed`, `width`,
+`height`, `seconds`). Defaults: 1024 × 1024, the model's own steps and guidance, a random seed.
+`--low-ram` is the app's Save memory. Video, upscale and edit options follow the engine's
+benchmark table (`Engine/Sources/turbo-engine/Bench.swift`); the music, sound-effect and 3D
+families are not wired in yet.
+
 ## Troubleshooting
 
 - **Engine Log** (⌥⌘L): what the engine prints, warnings included.

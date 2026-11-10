@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""turbo-gen: generate an image (or clip) with the Turbo MLX engine from the command line.
+
+Drives `turbo-engine serve` (JSON lines on stdin/stdout), the same protocol the Turbo MLX app
+uses, so scripts and coding agents can generate without the app. Models are read from the
+Hugging Face hub cache the app downloads into: the folder chosen in the app's Settings → Models,
+else ~/.cache/huggingface/hub.
+
+Build the engine first: scripts/build-engine.sh (gives build/bin/turbo-engine).
+
+  turbo-gen "a lighthouse at dusk" -m z-image-turbo -o out.png
+  turbo-gen "make it winter" -m flux2-klein -i photo.png -o edit.png
+  turbo-gen --list
+
+Environment: TURBO_ENGINE (the engine binary), TURBO_HUB (the hub cache folder).
+"""
+import argparse
+import json
+import os
+import plistlib
+import random
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+ENGINE = os.environ.get("TURBO_ENGINE", str(REPO / "build/bin/turbo-engine"))
+FALLBACK_HUB = Path.home() / ".cache/huggingface/hub"
+APP_PREFS = Path.home() / "Library/Containers/io.github.rinste.TurboMLX/Data/Library/Preferences/io.github.rinste.TurboMLX.plist"
+
+
+def app_hub():
+    """The hub cache the app uses: the folder picked in Settings → Models, if any."""
+    try:
+        prefs = plistlib.loads(APP_PREFS.read_bytes())
+    except (OSError, plistlib.InvalidFileException):
+        return None
+    folder = prefs.get("modelFolderPath")
+    if not folder:
+        return None
+    folder = Path(folder)
+    return folder if prefs.get("modelFolderIsHub") else folder / "hub"
+
+
+HUB = Path(os.environ["TURBO_HUB"]) if os.environ.get("TURBO_HUB") else (app_hub() or FALLBACK_HUB)
+
+GEMMA = "mlx-community/gemma-3-12b-it-4bit"
+
+# name: (repo, family, variant, quantize, steps, guidance, companion)
+MODELS = {
+    "z-image-turbo":      ("mflux-community/z-image-turbo-mflux-q8", "z-image-turbo", None, None, 9, 1, None),
+    "z-image-turbo-q4":   ("mflux-community/z-image-turbo-mflux-q4", "z-image-turbo", None, None, 9, 1, None),
+    "flux2-klein":        ("mflux-community/flux2-klein-4b-mflux-q4", "flux2-klein", "flux2-klein-4b", None, 4, 1, None),
+    "flux3-klein":        ("black-forest-labs/flux-3-image-klein", "flux3-klein", "flux3-image-klein", 8, 16, 1, None),
+    "moss-image":         ("mlx-community/MOSS-Image-SFT-bf16", "moss-image", None, 8, 50, 3, None),
+    "sensenova":          ("mlx-community/SenseNova-U1.5-8B-MoT-8step-4bit", "sensenova", None, None, 8, 1, None),
+    "ming":               ("joeynyc/Ming-Image-0.1-Design-mflux-q8-te5", "ming", None, None, 12, 1, None),
+    "qwen-image":         ("mflux-community/qwen-image-2512-mflux-q4", "qwen-image", None, None, 20, 4, None),
+    "qwen-image-edit":    ("mflux-community/qwen-image-edit-2511-mflux-q4", "qwen-image-edit", None, None, 20, 4, None),
+    "seedvr2":            ("numz/SeedVR2_comfyUI", "seedvr2", None, None, 1, 1, None),
+    "ltx-2.3":            ("dgrauet/ltx-2.3-mlx-q4", "ltx-2", None, None, 8, 1, GEMMA),
+    "ltx-2.3-q8":         ("dgrauet/ltx-2.3-mlx-q8", "ltx-2", None, None, 8, 1, GEMMA),
+    "ltx-2.5":            ("dgrauet/ltx-2.5-mlx-q4", "ltx-2.5", None, None, 8, 1, None),
+}
+VIDEO = {"ltx-2", "ltx-2.5"}
+
+
+def snapshot(repo):
+    """The snapshot folder of `repo` in the hub cache (refs/main, else the newest), or None."""
+    for hub in (HUB, FALLBACK_HUB):
+        folder = hub / ("models--" + repo.replace("/", "--"))
+        snaps = folder / "snapshots"
+        ref = folder / "refs" / "main"
+        if ref.exists():
+            candidate = snaps / ref.read_text().strip()
+            if candidate.is_dir():
+                return candidate
+        if snaps.is_dir():
+            entries = sorted(snaps.iterdir(), key=lambda p: p.stat().st_mtime)
+            if entries:
+                return entries[-1]
+    return None
+
+
+def list_models():
+    for name, (repo, family, *_rest) in MODELS.items():
+        path = snapshot(repo)
+        state = "ready" if path else "not downloaded"
+        print(f"{name:18} {state:15} {repo}")
+    print(f"\nhub: {HUB}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Generate with the Turbo MLX engine.")
+    ap.add_argument("prompt", nargs="?", help="what to generate (or the edit to make)")
+    ap.add_argument("-m", "--model", default="z-image-turbo", choices=MODELS)
+    ap.add_argument("-o", "--output", help="output file (.png, or .mp4 for video); default ./turbo-<time>.png")
+    ap.add_argument("-W", "--width", type=int, default=1024)
+    ap.add_argument("-H", "--height", type=int, default=1024)
+    ap.add_argument("-s", "--steps", type=int, help="default: the model's own")
+    ap.add_argument("-g", "--guidance", type=float, help="default: the model's own")
+    ap.add_argument("--seed", type=int, help="default: random")
+    ap.add_argument("-n", "--negative", help="negative prompt (models with guidance)")
+    ap.add_argument("-i", "--image", action="append", help="input picture (edit / upscale / first frame); repeatable")
+    ap.add_argument("--upscale", type=float, help="seedvr2: scale factor")
+    ap.add_argument("--frames", type=int, default=121, help="video: frame count")
+    ap.add_argument("--fps", type=float, default=24)
+    ap.add_argument("--low-ram", action="store_true", help="the app's Save memory")
+    ap.add_argument("--list", action="store_true", help="list models and whether they are downloaded")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    a = ap.parse_args()
+
+    if a.list:
+        list_models()
+        return 0
+    if a.prompt is None and a.model != "seedvr2":
+        ap.error("a prompt is required")
+
+    repo, family, variant, quantize, steps, guidance, companion = MODELS[a.model]
+    path = snapshot(repo)
+    if not path:
+        sys.exit(f"turbo-gen: {a.model} ({repo}) is not downloaded; get it in Turbo MLX → Settings → Models")
+    blobs = path.parent.parent / "blobs"
+    if blobs.is_dir() and any(b.name.endswith(".incomplete") for b in blobs.iterdir()):
+        sys.exit(f"turbo-gen: {a.model} is still downloading; try again when Turbo MLX has finished")
+    model = {"family": family, "path": str(path), "name": a.model}
+    if variant:
+        model["variant"] = variant
+    if quantize:
+        model["quantize"] = quantize
+    if a.low_ram:
+        model["low_ram"] = True
+    if companion:
+        cpath = snapshot(companion)
+        if not cpath:
+            sys.exit(f"turbo-gen: {a.model} also needs {companion}, which is not downloaded")
+        model["text_encoder_path"] = str(cpath)
+
+    video = family in VIDEO
+    ext = ".mp4" if video else ".png"
+    output = Path(a.output or f"turbo-{time.strftime('%Y%m%d-%H%M%S')}{ext}").expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    params = {
+        "prompt": a.prompt or "",
+        "seed": a.seed if a.seed is not None else random.randrange(2**31),
+        "width": a.width,
+        "height": a.height,
+        "steps": a.steps or steps,
+        "guidance": a.guidance if a.guidance is not None else guidance,
+        "output": str(output),
+    }
+    if a.negative:
+        params["negative_prompt"] = a.negative
+    if a.image:
+        images = [str(Path(p).expanduser().resolve()) for p in a.image]
+        params["images"] = images
+        params["image"] = images[0]
+    if a.upscale:
+        params["upscale"] = a.upscale
+    if video:
+        params["frames"] = a.frames
+        params["fps"] = a.fps
+
+    if not os.access(ENGINE, os.X_OK):
+        sys.exit(f"turbo-gen: engine not found at {ENGINE} (run scripts/build-engine.sh in the turbo-mlx repo)")
+
+    proc = subprocess.Popen(
+        [ENGINE, "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL if a.quiet else sys.stderr, text=True, bufsize=1,
+    )
+    command = {"cmd": "generate", "id": "turbo-gen", "model": model, "params": params}
+    proc.stdin.write(json.dumps(command) + "\n")
+    proc.stdin.flush()
+
+    result = 1
+    for line in proc.stdout:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = event.get("event")
+        if kind == "done":
+            print(json.dumps({k: event.get(k) for k in ("path", "seed", "width", "height", "seconds")}))
+            result = 0
+            break
+        if kind in ("failed", "load_failed", "cancelled"):
+            print(f"turbo-gen: {kind}: {event.get('message', '')}", file=sys.stderr)
+            break
+        if not a.quiet:
+            if kind == "phase":
+                print(f"[{event.get('phase')}]", file=sys.stderr)
+            elif kind == "progress":
+                print(f"  step {event.get('step')}/{event.get('total')}", file=sys.stderr)
+            elif kind == "model_loaded":
+                print(f"  model loaded in {event.get('seconds')}s", file=sys.stderr)
+    try:
+        proc.stdin.write('{"cmd": "shutdown"}\n')
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    proc.wait(timeout=60)
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main())
